@@ -1,0 +1,993 @@
+// BoostSphere database schema (PostgreSQL)
+// Money is always stored as integer minor units (e.g. kobo for NGN) next to an explicit ISO-4217 currency code.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Identity & access ─────────────────────────────
+
+enum RoleKey {
+  CUSTOMER
+  SELLER
+  SUPPORT
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETION_REQUESTED
+  DELETED
+}
+
+model User {
+  id               String     @id @default(cuid())
+  email            String     @unique
+  passwordHash     String
+  status           UserStatus @default(ACTIVE)
+  emailVerifiedAt  DateTime?
+  twoFactorEnabled Boolean    @default(false)
+  twoFactorSecret  String? // AES-256-GCM encrypted TOTP secret
+  backupCodes      String[]   @default([]) // SHA-256 hashes, single use
+  referralCode     String     @unique
+  referredById     String?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+  lastLoginAt      DateTime?
+
+  referredBy    User?          @relation("Referrals", fields: [referredById], references: [id])
+  referrals     User[]         @relation("Referrals")
+  profile       UserProfile?
+  roles         UserRole[]
+  sessions      Session[]
+  tokens        AuthToken[]
+  orders        ServiceOrder[]
+  payments      Payment[]
+  wallets       WalletAccount[]
+  sellerProfile SellerProfile?
+  purchases     PurchaseTransaction[] @relation("BuyerPurchases")
+  tickets       SupportTicket[]       @relation("TicketOwner")
+  notifications Notification[]
+  savedListings SavedListing[]
+  reviews       Review[]
+  auditLogs     AuditLog[]
+  deletionRequests AccountDeletionRequest[]
+  assignedOrders   ServiceOrder[] @relation("OrderAssignee")
+  assignedTickets  SupportTicket[] @relation("TicketAssignee")
+  payoutAccount    PayoutAccount?
+  payoutRequests   PayoutRequest[]
+
+  @@index([referredById])
+  @@map("users")
+}
+
+model UserProfile {
+  userId      String   @id
+  displayName String
+  phone       String?
+  country     String   @default("NG")
+  preferredCurrency String @default("NGN")
+  marketingOptIn Boolean @default(false)
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_profiles")
+}
+
+model Role {
+  id          String     @id @default(cuid())
+  key         RoleKey    @unique
+  name        String
+  description String
+  users       UserRole[]
+
+  @@map("roles")
+}
+
+model UserRole {
+  userId    String
+  roleId    String
+  grantedAt DateTime @default(now())
+  grantedBy String?
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  tokenHash    String   @unique // SHA-256 of the cookie token; raw token is never stored
+  userId       String
+  twoFactorPending Boolean @default(false)
+  ip           String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime
+  lastSeenAt   DateTime @default(now())
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+enum AuthTokenType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+}
+
+model AuthToken {
+  id        String        @id @default(cuid())
+  userId    String
+  type      AuthTokenType
+  tokenHash String        @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime      @default(now())
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@map("auth_tokens")
+}
+
+model AccountDeletionRequest {
+  id          String   @id @default(cuid())
+  userId      String
+  reason      String?
+  status      String   @default("PENDING") // PENDING | COMPLETED | REJECTED
+  createdAt   DateTime @default(now())
+  processedAt DateTime?
+  processedBy String?
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@map("account_deletion_requests")
+}
+
+// ───────────────────────────── Catalog ─────────────────────────────
+
+enum PublishStatus {
+  DRAFT
+  PUBLISHED
+  PAUSED
+  ARCHIVED
+}
+
+model SocialPlatform {
+  id          String        @id @default(cuid())
+  slug        String        @unique
+  name        String
+  tagline     String
+  description String
+  iconKey     String // simple-icons slug or "monogram"
+  brandColor  String // hex, used for accents only
+  sortOrder   Int           @default(0)
+  status      PublishStatus @default(PUBLISHED)
+  transferGuidance String   @default("") // platform's official transfer procedure summary for the marketplace
+  marketplaceEnabled Boolean @default(false)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  categories  ServiceCategory[]
+  services    Service[]
+  listings    MarketplaceListing[]
+  faqs        FaqItem[]
+
+  @@map("social_platforms")
+}
+
+model ServiceCategory {
+  id          String         @id @default(cuid())
+  platformId  String
+  slug        String
+  name        String
+  description String
+  sortOrder   Int            @default(0)
+  platform    SocialPlatform @relation(fields: [platformId], references: [id], onDelete: Restrict)
+  services    Service[]
+
+  @@unique([platformId, slug])
+  @@map("service_categories")
+}
+
+enum PricingModel {
+  PACKAGE // fixed price per package
+  PER_UNIT // unit price × quantity, within min/max
+}
+
+enum FulfillmentType {
+  MANUAL
+  PROVIDER_API
+  AD_CAMPAIGN
+  CONSULTATION
+  DIGITAL_DELIVERABLE
+}
+
+model Service {
+  id               String          @id @default(cuid())
+  slug             String          @unique
+  platformId       String
+  categoryId       String
+  name             String
+  summary          String
+  description      String
+  imageUrl         String?
+  pricingModel     PricingModel    @default(PACKAGE)
+  currency         String          @default("NGN")
+  unitPriceMinor   Int? // PER_UNIT only: price per `unitSize` units
+  unitSize         Int             @default(1)
+  unitLabel        String          @default("unit")
+  minQuantity      Int?
+  maxQuantity      Int?
+  fulfillmentType  FulfillmentType @default(MANUAL)
+  providerKey      String? // adapter key when fulfillmentType = PROVIDER_API
+  estimatedDuration String // human readable, e.g. "3–5 business days"
+  inputFields      Json            @default("[]") // admin-defined customer input schema (see src/lib/service-inputs.ts)
+  refundPolicy     String
+  terms            String
+  eligibility      String
+  deliveryNotes    String          @default("")
+  outcomeDisclaimer String         @default("Promotion increases visibility to real audiences. Results such as follows, views or sales are not guaranteed.")
+  status           PublishStatus   @default(DRAFT)
+  featured         Boolean         @default(false)
+  refundable       Boolean         @default(true)
+  sortOrder        Int             @default(0)
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  platform         SocialPlatform  @relation(fields: [platformId], references: [id], onDelete: Restrict)
+  category         ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  packages         ServicePackage[]
+  orders           ServiceOrder[]
+  reviews          Review[]
+
+  @@index([platformId, status])
+  @@index([categoryId])
+  @@index([status, featured])
+  @@map("services")
+}
+
+model ServicePackage {
+  id          String   @id @default(cuid())
+  serviceId   String
+  name        String
+  description String
+  priceMinor  Int
+  currency    String   @default("NGN")
+  features    String[] @default([])
+  duration    String?
+  active      Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  service     Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  orders      ServiceOrder[]
+
+  @@index([serviceId])
+  @@map("service_packages")
+}
+
+// ───────────────────────────── Orders ─────────────────────────────
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAYMENT_CONFIRMED
+  PROCESSING
+  IN_PROGRESS
+  AWAITING_CUSTOMER_INFO
+  COMPLETED
+  CANCELLED
+  REFUND_PENDING
+  REFUNDED
+  UNDER_REVIEW
+}
+
+model ServiceOrder {
+  id              String      @id @default(cuid())
+  number          String      @unique // human friendly, e.g. BS-24A9F3
+  userId          String
+  serviceId       String
+  packageId       String?
+  quantity        Int         @default(1)
+  inputs          Json // validated customer inputs (never credentials)
+  status          OrderStatus @default(PENDING_PAYMENT)
+  currency        String
+  subtotalMinor   Int
+  discountMinor   Int         @default(0)
+  taxMinor        Int         @default(0)
+  feeMinor        Int         @default(0)
+  totalMinor      Int
+  pricingSnapshot Json // full server-side price breakdown at order time
+  couponId        String?
+  assigneeId      String?
+  fulfillmentType FulfillmentType
+  completionEvidence String?
+  termsAcceptedAt DateTime
+  paidAt          DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  user            User        @relation(fields: [userId], references: [id], onDelete: Restrict)
+  service         Service     @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  package         ServicePackage? @relation(fields: [packageId], references: [id], onDelete: SetNull)
+  coupon          Coupon?     @relation(fields: [couponId], references: [id], onDelete: SetNull)
+  assignee        User?       @relation("OrderAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  events          OrderEvent[]
+  payments        Payment[]
+  refunds         Refund[]
+  reviews         Review[]
+  couponRedemptions CouponRedemption[]
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@index([serviceId])
+  @@map("service_orders")
+}
+
+model OrderEvent {
+  id         String       @id @default(cuid())
+  orderId    String
+  fromStatus OrderStatus?
+  toStatus   OrderStatus?
+  type       String // STATUS_CHANGE | NOTE | INTERNAL_NOTE | EVIDENCE | INFO_PROVIDED
+  message    String?
+  internal   Boolean      @default(false) // internal notes are never shown to customers
+  actorId    String?
+  actorType  String // CUSTOMER | STAFF | SYSTEM
+  createdAt  DateTime     @default(now())
+  order      ServiceOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, createdAt])
+  @@map("order_events")
+}
+
+// ───────────────────────────── Payments & accounting ─────────────────────────────
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  ABANDONED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum PaymentPurpose {
+  SERVICE_ORDER
+  MARKETPLACE_PURCHASE
+  WALLET_DEPOSIT
+}
+
+model Payment {
+  id                String         @id @default(cuid())
+  reference         String         @unique // our reference, sent to the provider
+  provider          String // paystack | flutterwave | stripe | wallet | sandbox
+  providerReference String? // provider's own transaction id
+  purpose           PaymentPurpose
+  userId            String
+  orderId           String?
+  purchaseId        String?
+  amountMinor       Int
+  currency          String
+  status            PaymentStatus  @default(PENDING)
+  providerFeeMinor  Int?
+  failureReason     String?
+  checkoutUrl       String?
+  verifiedAt        DateTime?
+  rawStatus         String? // provider status string from last verification
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  user              User           @relation(fields: [userId], references: [id], onDelete: Restrict)
+  order             ServiceOrder?  @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  purchase          PurchaseTransaction? @relation(fields: [purchaseId], references: [id], onDelete: SetNull)
+  refunds           Refund[]
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@index([orderId])
+  @@index([purchaseId])
+  @@map("payments")
+}
+
+model PaymentWebhookEvent {
+  id          String   @id @default(cuid())
+  provider    String
+  eventKey    String // provider event id, or derived hash for providers without one
+  eventType   String
+  reference   String?
+  processed   Boolean  @default(false)
+  error       String?
+  receivedAt  DateTime @default(now())
+
+  @@unique([provider, eventKey])
+  @@index([reference])
+  @@map("payment_webhook_events")
+}
+
+enum RefundStatus {
+  REQUESTED
+  APPROVED
+  PROCESSING
+  SUCCEEDED
+  REJECTED
+  FAILED
+}
+
+model Refund {
+  id            String       @id @default(cuid())
+  orderId       String?
+  purchaseId    String?
+  paymentId     String?
+  requestedById String
+  amountMinor   Int
+  currency      String
+  reason        String
+  destination   String // ORIGINAL_METHOD | WALLET
+  status        RefundStatus @default(REQUESTED)
+  previousStatus String? // order/purchase status before the refund request, restored on rejection
+  providerRefundId String?
+  adminNote     String?
+  processedById String?
+  createdAt     DateTime     @default(now())
+  processedAt   DateTime?
+  order         ServiceOrder? @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  purchase      PurchaseTransaction? @relation(fields: [purchaseId], references: [id], onDelete: SetNull)
+  payment       Payment?     @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([orderId])
+  @@map("refunds")
+}
+
+// Platform financial journal. Append-only; one row per money movement.
+model Transaction {
+  id          String   @id @default(cuid())
+  type        String // PAYMENT_RECEIVED | REFUND_ISSUED | PROVIDER_FEE | SELLER_PAYOUT_DUE | WALLET_DEPOSIT | WALLET_SPEND
+  sourceType  String // payment | refund | purchase | wallet_entry
+  sourceId    String
+  userId      String?
+  amountMinor Int // positive = inflow to platform, negative = outflow
+  currency    String
+  description String
+  createdAt   DateTime @default(now())
+
+  @@unique([sourceType, sourceId, type]) // idempotency: a source can only produce each journal line once
+  @@index([createdAt])
+  @@index([userId])
+  @@map("transactions")
+}
+
+// ───────────────────────────── Wallet (ledger) ─────────────────────────────
+
+model WalletAccount {
+  id        String   @id @default(cuid())
+  userId    String
+  currency  String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Restrict)
+  entries   WalletLedgerEntry[]
+
+  @@unique([userId, currency])
+  @@map("wallet_accounts")
+}
+
+enum WalletBucket {
+  AVAILABLE // customer funds (deposits, refunds)
+  PROMOTIONAL // non-withdrawable promotional credit
+  PENDING // funds tied to pending transactions
+}
+
+// Immutable: rows are only ever inserted. Balances are SUM(amountMinor) per bucket.
+model WalletLedgerEntry {
+  id             String       @id @default(cuid())
+  walletId       String
+  bucket         WalletBucket
+  amountMinor    Int // signed
+  type           String // DEPOSIT | PURCHASE | REFUND | PROMO_CREDIT | ADMIN_ADJUSTMENT | REVERSAL
+  description    String
+  referenceType  String?
+  referenceId    String?
+  idempotencyKey String       @unique
+  createdById    String?
+  createdAt      DateTime     @default(now())
+  wallet         WalletAccount @relation(fields: [walletId], references: [id], onDelete: Restrict)
+
+  @@index([walletId, createdAt])
+  @@map("wallet_ledger_entries")
+}
+
+// ───────────────────────────── Payouts (withdrawals) ─────────────────────────────
+
+// Bank account used for manual payouts. The account number is AES-256-GCM encrypted; only the last 4 digits are shown.
+model PayoutAccount {
+  userId           String   @id
+  bankName         String
+  accountName      String
+  accountNumberEnc String
+  accountLast4     String
+  updatedAt        DateTime @updatedAt
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("payout_accounts")
+}
+
+enum PayoutStatus {
+  REQUESTED // funds moved AVAILABLE → PENDING in the wallet
+  PAID // transfer sent by an admin; PENDING funds debited
+  REJECTED // funds released back to AVAILABLE
+  CANCELLED // cancelled by the user; funds released
+}
+
+model PayoutRequest {
+  id              String       @id @default(cuid())
+  number          String       @unique
+  userId          String
+  amountMinor     Int
+  currency        String
+  status          PayoutStatus @default(REQUESTED)
+  bankName        String // snapshot of the payout account at request time
+  accountName     String
+  accountNumberEnc String
+  accountLast4    String
+  transferReference String? // bank/provider reference entered by the admin when paid
+  adminNote       String?
+  processedById   String?
+  createdAt       DateTime     @default(now())
+  processedAt     DateTime?
+  user            User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([status])
+  @@index([userId])
+  @@map("payout_requests")
+}
+
+// ───────────────────────────── Marketplace ─────────────────────────────
+
+enum VerificationStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+model SellerProfile {
+  id                 String             @id @default(cuid())
+  userId             String             @unique
+  displayName        String
+  bio                String             @default("")
+  verificationStatus VerificationStatus @default(UNVERIFIED)
+  verificationNote   String?
+  verificationSubmittedAt DateTime?
+  verificationDocKeys String[]         @default([]) // private storage keys (ID / business documents); staff-only access
+  verifiedAt         DateTime?
+  completedSales     Int                @default(0)
+  payoutDetailsOnFile Boolean           @default(false)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  user               User               @relation(fields: [userId], references: [id], onDelete: Restrict)
+  listings           MarketplaceListing[]
+  sales              PurchaseTransaction[] @relation("SellerSales")
+
+  @@map("seller_profiles")
+}
+
+enum ListingStatus {
+  DRAFT
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  SUSPENDED
+  RESERVED // a purchase is in progress
+  SOLD
+  WITHDRAWN
+}
+
+model MarketplaceListing {
+  id               String        @id @default(cuid())
+  slug             String        @unique
+  sellerId         String
+  platformId       String
+  title            String
+  accountType      String // CREATOR | BUSINESS | BRAND | COMMUNITY | OTHER
+  description      String
+  niche            String
+  askingPriceMinor Int
+  currency         String        @default("NGN")
+  audienceSize     Int?
+  audienceSizeVerified Boolean   @default(false)
+  engagementSummary String?
+  accountCreatedYear Int?
+  accountAgeVerified Boolean     @default(false)
+  audienceLocation String?
+  audienceLanguage String?
+  analyticsSummary String? // redacted, seller supplied, moderator reviewed
+  transferMethod   String // description of the platform-authorized transfer procedure
+  transferEligibilityConfirmed Boolean @default(false) // seller attestation
+  ownershipEvidenceNote String? // internal: what evidence was reviewed (never public)
+  status           ListingStatus @default(DRAFT)
+  moderationNote   String?
+  reviewedById     String?
+  reviewedAt       DateTime?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  seller           SellerProfile @relation(fields: [sellerId], references: [id], onDelete: Restrict)
+  platform         SocialPlatform @relation(fields: [platformId], references: [id], onDelete: Restrict)
+  images           ListingImage[]
+  purchases        PurchaseTransaction[]
+  reports          ListingReport[]
+  savedBy          SavedListing[]
+
+  @@index([status, platformId])
+  @@index([sellerId])
+  @@map("marketplace_listings")
+}
+
+model ListingImage {
+  id         String   @id @default(cuid())
+  listingId  String
+  storageKey String // private object storage key; served through an authorization-checked route
+  alt        String
+  sortOrder  Int      @default(0)
+  createdAt  DateTime @default(now())
+  listing    MarketplaceListing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  @@index([listingId])
+  @@map("listing_images")
+}
+
+model SavedListing {
+  userId    String
+  listingId String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  listing   MarketplaceListing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  @@id([userId, listingId])
+  @@map("saved_listings")
+}
+
+model ListingReport {
+  id          String   @id @default(cuid())
+  listingId   String
+  reporterId  String?
+  reason      String // STOLEN_OR_COMPROMISED | MISLEADING | PROHIBITED_TRANSFER | FRAUD | OTHER
+  details     String
+  status      String   @default("OPEN") // OPEN | ACTIONED | DISMISSED
+  resolution  String?
+  createdAt   DateTime @default(now())
+  resolvedAt  DateTime?
+  listing     MarketplaceListing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@map("listing_reports")
+}
+
+enum PurchaseStatus {
+  PENDING_PAYMENT
+  PAID // funds received; seller payout on hold until transfer verified
+  TRANSFER_IN_PROGRESS
+  AWAITING_VERIFICATION
+  COMPLETED
+  DISPUTED
+  CANCELLED
+  REFUND_PENDING
+  REFUNDED
+}
+
+model PurchaseTransaction {
+  id              String         @id @default(cuid())
+  number          String         @unique
+  listingId       String
+  buyerId         String
+  sellerId        String
+  status          PurchaseStatus @default(PENDING_PAYMENT)
+  currency        String
+  priceMinor      Int
+  buyerFeeMinor   Int            @default(0)
+  totalMinor      Int
+  sellerCommissionMinor Int      @default(0)
+  sellerPayoutMinor Int          @default(0)
+  payoutStatus    String         @default("NOT_DUE") // NOT_DUE | ON_HOLD | DUE | PAID (manual payout, see docs)
+  termsAcceptedAt DateTime
+  paidAt          DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  listing         MarketplaceListing @relation(fields: [listingId], references: [id], onDelete: Restrict)
+  buyer           User           @relation("BuyerPurchases", fields: [buyerId], references: [id], onDelete: Restrict)
+  seller          SellerProfile  @relation("SellerSales", fields: [sellerId], references: [id], onDelete: Restrict)
+  milestones      TransferMilestone[]
+  disputes        Dispute[]
+  payments        Payment[]
+  refunds         Refund[]
+  reviews         Review[]
+
+  @@index([buyerId])
+  @@index([sellerId])
+  @@index([status])
+  @@map("purchase_transactions")
+}
+
+enum MilestoneStatus {
+  PENDING
+  SUBMITTED // evidence submitted by the responsible party
+  CONFIRMED // confirmed by the counterparty or an administrator
+  REJECTED
+}
+
+model TransferMilestone {
+  id            String          @id @default(cuid())
+  purchaseId    String
+  sortOrder     Int
+  title         String
+  description   String
+  responsible   String // SELLER | BUYER
+  confirmer     String // BUYER | SELLER | ADMIN
+  status        MilestoneStatus @default(PENDING)
+  evidenceNote  String?
+  evidenceKey   String? // private storage key
+  submittedAt   DateTime?
+  confirmedAt   DateTime?
+  confirmedById String?
+  purchase      PurchaseTransaction @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+
+  @@unique([purchaseId, sortOrder])
+  @@map("transfer_milestones")
+}
+
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED_BUYER
+  RESOLVED_SELLER
+  CLOSED
+}
+
+model Dispute {
+  id          String        @id @default(cuid())
+  purchaseId  String
+  openedById  String
+  reason      String
+  details     String
+  status      DisputeStatus @default(OPEN)
+  purchaseStatusBefore PurchaseStatus // restored when a dispute is closed without a refund
+  resolution  String?
+  resolvedById String?
+  createdAt   DateTime      @default(now())
+  resolvedAt  DateTime?
+  purchase    PurchaseTransaction @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  messages    DisputeMessage[]
+
+  @@index([status])
+  @@map("disputes")
+}
+
+model DisputeMessage {
+  id        String   @id @default(cuid())
+  disputeId String
+  authorId  String
+  authorRole String // BUYER | SELLER | STAFF
+  body      String
+  createdAt DateTime @default(now())
+  dispute   Dispute  @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+
+  @@index([disputeId])
+  @@map("dispute_messages")
+}
+
+// ───────────────────────────── Engagement ─────────────────────────────
+
+model Review {
+  id         String   @id @default(cuid())
+  userId     String
+  serviceId  String?
+  orderId    String?
+  purchaseId String?
+  rating     Int // 1–5
+  title      String
+  body       String
+  status     String   @default("PENDING") // PENDING | APPROVED | REJECTED — only APPROVED reviews are public
+  featured   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  service    Service? @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  order      ServiceOrder? @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  purchase   PurchaseTransaction? @relation(fields: [purchaseId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, orderId])
+  @@unique([userId, purchaseId])
+  @@index([status, featured])
+  @@map("reviews")
+}
+
+model Coupon {
+  id              String   @id @default(cuid())
+  code            String   @unique
+  description     String   @default("")
+  type            String // PERCENT | FIXED
+  value           Int // basis points for PERCENT (1000 = 10%), minor units for FIXED
+  currency        String? // required for FIXED
+  minOrderMinor   Int      @default(0)
+  maxDiscountMinor Int?
+  maxRedemptions  Int?
+  perUserLimit    Int      @default(1)
+  redemptionCount Int      @default(0)
+  platformId      String?
+  serviceId       String?
+  startsAt        DateTime?
+  expiresAt       DateTime?
+  active          Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  redemptions     CouponRedemption[]
+  orders          ServiceOrder[]
+
+  @@map("coupons")
+}
+
+model CouponRedemption {
+  id        String   @id @default(cuid())
+  couponId  String
+  userId    String
+  orderId   String   @unique
+  discountMinor Int
+  createdAt DateTime @default(now())
+  coupon    Coupon   @relation(fields: [couponId], references: [id], onDelete: Restrict)
+  order     ServiceOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([couponId, userId])
+  @@map("coupon_redemptions")
+}
+
+model SupportTicket {
+  id         String   @id @default(cuid())
+  number     String   @unique
+  userId     String?
+  guestEmail String?
+  subject    String
+  category   String // ORDER | PAYMENT | REFUND | MARKETPLACE | ACCOUNT | OTHER
+  status     String   @default("OPEN") // OPEN | PENDING_CUSTOMER | PENDING_STAFF | RESOLVED | CLOSED
+  priority   String   @default("NORMAL")
+  relatedOrderId String?
+  relatedPurchaseId String?
+  assigneeId String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  user       User?    @relation("TicketOwner", fields: [userId], references: [id], onDelete: SetNull)
+  assignee   User?    @relation("TicketAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  messages   SupportMessage[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("support_tickets")
+}
+
+model SupportMessage {
+  id        String   @id @default(cuid())
+  ticketId  String
+  authorId  String?
+  authorRole String // CUSTOMER | STAFF | GUEST
+  body      String
+  internal  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId, createdAt])
+  @@map("support_messages")
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  type      String
+  title     String
+  body      String
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+model EmailOutbox {
+  id        String   @id @default(cuid())
+  to        String
+  subject   String
+  text      String
+  status    String   @default("PENDING") // PENDING | SENT | FAILED | LOGGED
+  error     String?
+  createdAt DateTime @default(now())
+  sentAt    DateTime?
+
+  @@index([status])
+  @@map("email_outbox")
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String?
+  metadata   Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model IdempotencyKey {
+  id           String   @id @default(cuid())
+  userId       String
+  key          String
+  scope        String
+  requestHash  String
+  responseStatus Int?
+  responseBody Json?
+  createdAt    DateTime @default(now())
+
+  @@unique([userId, scope, key])
+  @@map("idempotency_keys")
+}
+
+model RateLimitBucket {
+  key       String   @id
+  count     Int
+  resetAt   DateTime
+
+  @@map("rate_limit_buckets")
+}
+
+model SiteSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+  updatedBy String?
+
+  @@map("site_settings")
+}
+
+model FaqItem {
+  id         String   @id @default(cuid())
+  platformId String?
+  question   String
+  answer     String
+  sortOrder  Int      @default(0)
+  published  Boolean  @default(true)
+  platform   SocialPlatform? @relation(fields: [platformId], references: [id], onDelete: Cascade)
+
+  @@index([platformId])
+  @@map("faq_items")
+}
+
+// Development-only simulated provider state (PAYMENT_SANDBOX_ENABLED). Never used in production.
+model SandboxCharge {
+  reference   String   @id
+  status      String // pending | success | failed
+  amountMinor Int
+  currency    String
+  updatedAt   DateTime @updatedAt
+
+  @@map("sandbox_charges")
+}
+
+model ContactMessage {
+  id        String   @id @default(cuid())
+  name      String
+  email     String
+  subject   String
+  message   String
+  handled   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@map("contact_messages")
+}

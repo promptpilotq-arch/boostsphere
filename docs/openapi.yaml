@@ -1,0 +1,239 @@
+openapi: 3.1.0
+info:
+  title: BoostSphere API
+  version: "1.0.0"
+  description: |
+    REST API used by the BoostSphere web app. All amounts are integers in minor units (kobo for NGN) with an explicit ISO-4217 currency.
+
+    **Auth:** session cookie `bs_session` (HttpOnly), obtained from `POST /auth/login`.
+    **CSRF:** state-changing requests must send an `Origin` header matching the site, with a JSON body.
+    **Idempotency:** endpoints marked *idempotent* accept an `Idempotency-Key` header. Retries with the same key and body return the original response.
+    **Errors:** `{ "error": { "code": "VALIDATION_ERROR", "message": "…", "details": [{ "path": "…", "message": "…" }] } }`.
+    Codes: BAD_REQUEST 400, UNAUTHENTICATED 401, FORBIDDEN 403, NOT_FOUND 404, CONFLICT 409, VALIDATION_ERROR 422, RATE_LIMITED 429, PAYMENT_PROVIDER_ERROR 502, NOT_CONFIGURED 503.
+    **Pagination:** `?page=1&pageSize=20` → `meta: { page, pageSize, total, totalPages }`.
+servers:
+  - url: /api/v1
+components:
+  securitySchemes:
+    session: { type: apiKey, in: cookie, name: bs_session }
+  parameters:
+    IdempotencyKey: { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 100 } }
+    Id: { name: id, in: path, required: true, schema: { type: string } }
+  schemas:
+    Error:
+      type: object
+      properties: { error: { type: object, properties: { code: { type: string }, message: { type: string }, details: { type: array, items: { type: object } } } } }
+    Quote:
+      type: object
+      properties:
+        currency: { type: string, example: NGN }
+        subtotalMinor: { type: integer }
+        discountMinor: { type: integer }
+        taxMinor: { type: integer }
+        feeMinor: { type: integer }
+        totalMinor: { type: integer }
+        lines: { type: array, items: { type: object, properties: { label: { type: string }, amountMinor: { type: integer } } } }
+    OrderInput:
+      type: object
+      required: [serviceId, acceptTerms]
+      properties:
+        serviceId: { type: string }
+        packageId: { type: string, description: Required for PACKAGE services }
+        quantity: { type: integer, minimum: 1, description: Required for PER_UNIT services }
+        inputs: { type: object, additionalProperties: { type: string }, description: "Values for the service's inputFields. Never credentials." }
+        couponCode: { type: string }
+        acceptTerms: { type: boolean, enum: [true] }
+    OrderStatus:
+      type: string
+      enum: [PENDING_PAYMENT, PAYMENT_CONFIRMED, PROCESSING, IN_PROGRESS, AWAITING_CUSTOMER_INFO, COMPLETED, CANCELLED, REFUND_PENDING, REFUNDED, UNDER_REVIEW]
+security: [{ session: [] }]
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Register (also signs in; email verification required before ordering)
+      requestBody: { content: { application/json: { schema: { type: object, required: [email, password, displayName, acceptTerms], properties: { email: { type: string }, password: { type: string, minLength: 10 }, displayName: { type: string }, referralCode: { type: string }, acceptTerms: { type: boolean, enum: [true] } } } } } }
+      responses: { "201": { description: Created }, "409": { description: Email exists }, "422": { description: Invalid } }
+  /auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Sign in. If twoFactorRequired, complete with /auth/2fa/verify
+      requestBody: { content: { application/json: { schema: { type: object, properties: { email: { type: string }, password: { type: string } } } } } }
+      responses: { "200": { description: "{ twoFactorRequired: boolean } + Set-Cookie" }, "401": { description: Bad credentials }, "429": { description: Rate limited } }
+  /auth/2fa/verify:
+    post: { tags: [Auth], summary: Second factor (TOTP or backup code), requestBody: { content: { application/json: { schema: { type: object, properties: { code: { type: string } } } } } }, responses: { "200": { description: OK } } }
+  /auth/logout:
+    post: { tags: [Auth], summary: Sign out current session, responses: { "200": { description: OK } } }
+  /auth/email:
+    post: { tags: [Auth], summary: "{ token } verifies email; {} resends verification", responses: { "200": { description: OK } } }
+  /auth/password:
+    post: { tags: [Auth], security: [], summary: "{ email } requests reset link; { token, password } resets", responses: { "200": { description: OK } } }
+  /me:
+    get: { tags: [Account], summary: Current user and profile, responses: { "200": { description: OK } } }
+    patch: { tags: [Account], summary: Update profile, responses: { "200": { description: OK } } }
+  /me/security:
+    get: { tags: [Account], summary: Sessions and 2FA status, responses: { "200": { description: OK } } }
+    post:
+      tags: [Account]
+      summary: "Security actions: change_password, 2fa_setup, 2fa_enable, 2fa_disable, revoke_session, revoke_other_sessions, request_deletion"
+      responses: { "200": { description: OK } }
+  /me/notifications:
+    get: { tags: [Account], summary: List notifications, responses: { "200": { description: OK } } }
+    post: { tags: [Account], summary: "Mark read ({ ids? })", responses: { "200": { description: OK } } }
+  /me/wallet:
+    get: { tags: [Wallet], summary: Balances (available, promotional, pending) and ledger entries, parameters: [{ name: currency, in: query, schema: { type: string } }], responses: { "200": { description: OK } } }
+  /me/saved-listings:
+    post: { tags: [Marketplace], summary: "Save/unsave a listing { listingId, saved }", responses: { "200": { description: OK } } }
+  /platforms:
+    get: { tags: [Catalog], security: [], summary: Published platforms, responses: { "200": { description: OK } } }
+  /services:
+    get:
+      tags: [Catalog]
+      security: []
+      summary: Search published services
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: platform, in: query, schema: { type: string } }
+        - { name: category, in: query, schema: { type: string } }
+        - { name: sort, in: query, schema: { type: string, enum: [relevance, price_asc, price_desc, newest, name] } }
+        - { name: page, in: query, schema: { type: integer } }
+      responses: { "200": { description: OK } }
+  /services/{slug}:
+    get: { tags: [Catalog], security: [], summary: Published service with packages and input fields, parameters: [{ name: slug, in: path, required: true, schema: { type: string } }], responses: { "200": { description: OK }, "404": { description: Not found or not published } } }
+  /quote:
+    post:
+      tags: [Orders]
+      security: []
+      summary: Server-side price quote
+      requestBody: { content: { application/json: { schema: { type: object, properties: { serviceId: { type: string }, packageId: { type: string }, quantity: { type: integer }, couponCode: { type: string } } } } } }
+      responses: { "200": { description: "{ quote: Quote }" } }
+  /orders:
+    get: { tags: [Orders], summary: My orders, parameters: [{ name: status, in: query, schema: { $ref: "#/components/schemas/OrderStatus" } }], responses: { "200": { description: OK } } }
+    post:
+      tags: [Orders]
+      summary: Create a PENDING_PAYMENT order (idempotent). Total is computed server-side.
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/OrderInput" } } } }
+      responses: { "200": { description: "{ order }" }, "403": { description: Email not verified }, "422": { description: Validation (quantity, URL, availability, coupon) } }
+  /orders/{id}:
+    get: { tags: [Orders], summary: Order with timeline (customer-visible events only), parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK }, "404": { description: Not found / not yours } } }
+    post:
+      tags: [Orders]
+      summary: "Customer actions: cancel | provide_info { message } | request_refund { reason } (idempotent)"
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      responses: { "200": { description: OK }, "409": { description: Invalid state } }
+  /payments:
+    get: { tags: [Payments], summary: My payment history, responses: { "200": { description: OK } } }
+    post:
+      tags: [Payments]
+      summary: Create a pending payment and start checkout (idempotent). Returns redirectUrl.
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, properties: { purpose: { const: SERVICE_ORDER }, orderId: { type: string }, provider: { type: string } } }
+                - { type: object, properties: { purpose: { const: MARKETPLACE_PURCHASE }, purchaseId: { type: string }, provider: { type: string } } }
+                - { type: object, properties: { purpose: { const: WALLET_DEPOSIT }, amountMinor: { type: integer }, currency: { type: string }, provider: { type: string } } }
+      responses: { "200": { description: "{ paymentId, reference, status, redirectUrl }" } }
+  /payments/verify:
+    post: { tags: [Payments], summary: Server-to-server verification of my payment by reference, responses: { "200": { description: OK } } }
+  /payments/sandbox:
+    post: { tags: [Payments], summary: "DEV ONLY: simulate sandbox outcome { reference, outcome: success|failed }", responses: { "200": { description: OK }, "404": { description: Disabled } } }
+  /webhooks/{provider}:
+    post:
+      tags: [Payments]
+      security: []
+      summary: Provider webhooks (paystack, flutterwave, stripe, sandbox). Signature verified on raw body; deduplicated; re-verified with provider.
+      parameters: [{ name: provider, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: Accepted or duplicate }, "401": { description: Invalid signature } }
+  /receipts/{reference}:
+    get: { tags: [Payments], summary: Downloadable HTML receipt for a successful payment, parameters: [{ name: reference, in: path, required: true, schema: { type: string } }], responses: { "200": { description: text/html attachment } } }
+  /marketplace/listings:
+    get: { tags: [Marketplace], security: [], summary: Approved listings from verified sellers (q, platform, type, sort, minPrice, maxPrice, page), responses: { "200": { description: OK } } }
+  /marketplace/listings/{id}:
+    get: { tags: [Marketplace], security: [], summary: Listing detail (no internal moderation data), parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK } } }
+    post:
+      tags: [Marketplace]
+      summary: "purchase { acceptTerms: true } (idempotent; reserves listing) | report { reason, details }"
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      responses: { "200": { description: OK }, "409": { description: Not available / not approved } }
+  /seller:
+    get: { tags: [Selling], summary: My seller profile and listings, responses: { "200": { description: OK } } }
+    post: { tags: [Selling], summary: "JSON save_profile | request_verification { statement, attest }; or multipart with a document field (PNG/JPEG/WebP/PDF, max 5 MB, up to 5 files), private to the seller and marketplace moderators", responses: { "200": { description: OK } } }
+  /seller/listings:
+    post: { tags: [Selling], summary: Create draft listing, responses: { "200": { description: OK } } }
+  /seller/listings/{id}:
+    put: { tags: [Selling], summary: Update listing (approved listings return to review), parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK } } }
+    post: { tags: [Selling], summary: "JSON { action: submit|withdraw } or multipart image upload", parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK } } }
+  /purchases:
+    get: { tags: [Marketplace], summary: Purchases where I'm buyer or seller, responses: { "200": { description: OK } } }
+  /purchases/{id}:
+    get: { tags: [Marketplace], summary: Purchase with milestones and disputes, parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK } } }
+    post:
+      tags: [Marketplace]
+      summary: "cancel | submit_milestone { milestoneId, evidenceNote, evidenceKey? } | confirm_milestone | reject_milestone { note } | open_dispute { reason, details } (idempotent) | dispute_message { disputeId, body }. Multipart 'file' uploads evidence and returns { key }."
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses: { "200": { description: OK }, "409": { description: Invalid state (e.g. disputed) } }
+  /reviews:
+    get: { tags: [Reviews], security: [], summary: Approved reviews, responses: { "200": { description: OK } } }
+    post: { tags: [Reviews], summary: "Review a completed order or purchase { orderId|purchaseId, rating, title, body }", responses: { "200": { description: OK } } }
+  /support/tickets:
+    get: { tags: [Support], summary: My tickets, responses: { "200": { description: OK } } }
+    post: { tags: [Support], summary: Open ticket, responses: { "200": { description: OK } } }
+  /support/tickets/{id}:
+    get: { tags: [Support], summary: Ticket thread (internal notes hidden from customers), parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK } } }
+    post: { tags: [Support], summary: "Reply { body, internal?, status? } (internal/status: staff only)", parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK } } }
+  /contact:
+    post: { tags: [Support], security: [], summary: Public contact form, responses: { "200": { description: OK } } }
+  /files/{key}:
+    get: { tags: [Files], summary: Private file with authorization check, parameters: [{ name: key, in: path, required: true, schema: { type: string } }], responses: { "200": { description: File }, "404": { description: Not found / not allowed } } }
+  /admin/analytics:
+    get: { tags: [Admin], summary: "Revenue, orders, success rate, customers, sales by platform (permission analytics:read)", parameters: [{ name: days, in: query, schema: { type: integer } }], responses: { "200": { description: OK }, "403": { description: Forbidden } } }
+  /admin/orders:
+    get: { tags: [Admin], summary: Fulfillment queue (orders:manage), responses: { "200": { description: OK } } }
+  /admin/orders/{id}:
+    patch: { tags: [Admin], summary: "Staff update { status?, message?, internalNote?, assigneeId?, completionEvidence? } — validated transitions only", parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK }, "409": { description: Invalid transition } } }
+  /admin/services:
+    get: { tags: [Admin], summary: All services (catalog:manage), responses: { "200": { description: OK } } }
+    post: { tags: [Admin], summary: Create service with packages and input field schema, responses: { "200": { description: OK } } }
+  /admin/services/{id}:
+    put: { tags: [Admin], summary: Update service, parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK } } }
+    post: { tags: [Admin], summary: "Set status { status: DRAFT|PUBLISHED|PAUSED|ARCHIVED }", parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK } } }
+    delete: { tags: [Admin], summary: Delete (only if no orders), parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK }, "409": { description: Has orders } } }
+  /admin/catalog:
+    post: { tags: [Admin], summary: "Upsert { entity: platform|category|coupon|faq, id?, data } or { entity: faq_delete, id }", responses: { "200": { description: OK } } }
+  /admin/marketplace:
+    post: { tags: [Admin], summary: "moderate_listing | verify_seller | resolve_report (marketplace:moderate)", responses: { "200": { description: OK } } }
+  /admin/disputes/{id}:
+    post: { tags: [Admin], summary: "Resolve { outcome: UNDER_REVIEW|RESOLVED_BUYER|RESOLVED_SELLER|CLOSED, resolution }", parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK } } }
+  /admin/refunds/{id}:
+    post: { tags: [Admin], summary: "Decide { decision: APPROVE|REJECT, amountMinor?, destination?, note } or { decision: CONFIRM_PROCESSED } (refunds:approve)", parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK } } }
+  /admin/payments:
+    get: { tags: [Admin], summary: Payments list (payments:read), responses: { "200": { description: OK } } }
+    post: { tags: [Admin], summary: "Reconcile { reference? , olderThanMinutes? } (payments:manage)", responses: { "200": { description: OK } } }
+  /admin/users/{id}:
+    post: { tags: [Admin], summary: "set_roles | set_status | wallet_adjustment { bucket, amountMinor, reason, idempotencyKey } | process_deletion", parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK }, "403": { description: Admin roles need super admin } } }
+  /admin/settings:
+    get: { tags: [Admin], summary: Site settings and provider status, responses: { "200": { description: OK } } }
+    put: { tags: [Admin], summary: "Update a section { section: brand|home|commerce|features, value }", responses: { "200": { description: OK } } }
+  /admin/reviews/{id}:
+    post: { tags: [Admin], summary: "Moderate { status: APPROVED|REJECTED, featured? }", parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK } } }
+  /admin/audit:
+    get: { tags: [Admin], summary: Audit log (audit:read), responses: { "200": { description: OK } } }
+  /admin/export/{kind}:
+    get: { tags: [Admin], summary: "CSV export: orders|payments|refunds|transactions", parameters: [{ name: kind, in: path, required: true, schema: { type: string } }, { name: days, in: query, schema: { type: integer } }], responses: { "200": { description: text/csv } } }
+  /cron/maintenance:
+    post: { tags: [Ops], security: [], summary: "Reconcile pending payments, expire unpaid orders/reservations. Requires Authorization: Bearer CRON_SECRET", responses: { "200": { description: OK }, "401": { description: Unauthorized } } }
+  /me/payouts:
+    get: { tags: [Wallet], summary: "Masked payout account (bank, name, last 4) and withdrawal history", responses: { "200": { description: OK } } }
+    post:
+      tags: [Wallet]
+      summary: "save_account { bankName, accountName, accountNumber (10-digit NUBAN, stored encrypted) } | request { amountMinor, currency } (idempotent; holds AVAILABLE funds) | cancel { payoutId }"
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      responses: { "200": { description: OK }, "409": { description: Insufficient available balance or a request already open }, "422": { description: Below minimum / invalid account } }
+  /admin/payouts/{id}:
+    post: { tags: [Admin], summary: "{ decision: PAID, transferReference } | { decision: REJECTED, note } | { decision: REVEAL_ACCOUNT } (audited) — payouts:manage", parameters: [{ $ref: "#/components/parameters/Id" }], responses: { "200": { description: OK }, "409": { description: Already processed } } }

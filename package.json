@@ -1,0 +1,62 @@
+{
+  "name": "boostsphere",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BoostSphere — social media promotion services and authorized digital-asset marketplace",
+  "scripts": {
+    "db:start": "node scripts/dev-db.mjs",
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "prisma:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:seed": "prisma db seed",
+    "db:reset": "prisma migrate reset --force",
+    "admin:create": "tsx --env-file=.env scripts/create-admin.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.19.3",
+    "aws4fetch": "^1.0.20",
+    "bcryptjs": "^2.4.3",
+    "next": "^15.5.28",
+    "otplib": "^12.0.1",
+    "qrcode": "^1.5.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "simple-icons": "^13.21.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^22.20.5",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "autoprefixer": "^10.6.1",
+    "embedded-postgres": "^18.4.0-beta.17",
+    "postcss": "^8.5.30",
+    "prisma": "^6.19.3",
+    "server-only": "^0.0.1",
+    "tailwindcss": "^3.4.19",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "prisma@6.19.3": true,
+    "@prisma/client@6.19.3": true,
+    "@prisma/engines@6.19.3": true,
+    "@embedded-postgres/windows-x64@18.4.0-beta.17": true
+  }
+}
