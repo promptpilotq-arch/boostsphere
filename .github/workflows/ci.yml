@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# CI-only values. These are throwaway test settings, not production secrets.
+env:
+  NODE_VERSION: "24"
+  APP_URL: http://localhost:3000
+  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/boostsphere?schema=public
+  TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/boostsphere_test?schema=public
+  APP_ENCRYPTION_KEY: Y2ktb25seS1lbmNyeXB0aW9uLWtleS0zMi1ieXRlcyE=
+  PAYMENT_PROVIDERS: paystack,flutterwave,wallet,sandbox
+  PAYMENT_SANDBOX_ENABLED: "true"
+  CRON_SECRET: ci-cron-secret
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  test:
+    name: Typecheck, tests, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: boostsphere_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit and integration tests
+        run: npm test
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+      - name: Migrations apply cleanly to an empty database
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -c "CREATE DATABASE boostsphere"
+          npx prisma migrate deploy
+          npx prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url "$TEST_DATABASE_URL" --exit-code
+      - name: Production build
+        run: npm run build
+
+  e2e:
+    name: Browser journeys
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: boostsphere
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npx prisma migrate deploy
+      - name: Seed demo data
+        run: npx tsx prisma/seed.ts
+      - run: npx playwright install --with-deps chromium
+      - name: Start dev server (sandbox payments need a non-production server)
+        run: |
+          npm run dev > dev-server.log 2>&1 &
+          npx --yes wait-on@8 --timeout 180000 http-get://localhost:3000/robots.txt
+      - name: Smoke test every page (also warms the dev compiler)
+        run: npx tsx scripts/smoke.ts
+      - name: Playwright journeys
+        run: npx playwright test --reporter=line
+        env:
+          E2E_BASE_URL: http://localhost:3000
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: |
+            test-results/
+            dev-server.log
+          retention-days: 7
