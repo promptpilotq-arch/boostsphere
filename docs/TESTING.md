@@ -50,3 +50,12 @@ Additional coverage: CSRF origin rejection, invalid webhook signatures, provider
 ## Paystack test mode
 
 Set `PAYSTACK_SECRET_KEY=sk_test_…`, add `paystack` to `PAYMENT_PROVIDERS`, and expose your dev server for webhooks (e.g. `cloudflared tunnel --url http://localhost:3000`). Register `https://<tunnel>/api/v1/webhooks/paystack` in the Paystack dashboard, then pay with a [Paystack test card](https://paystack.com/docs/payments/test-payments/). Without a tunnel, the return page still verifies the payment server-to-server.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull request:
+
+1. **Typecheck, tests, build:** `npm ci`, TypeScript check, unit and integration tests against a PostgreSQL 16 service container, a check that migrations apply to an empty database and match `schema.prisma` (catches forgotten migrations), then the production build.
+2. **Browser journeys:** migrates and seeds a fresh database, starts the dev server (the sandbox payment provider is disabled in production builds), runs the page smoke test, then the Playwright journeys on desktop and mobile. Screenshots, traces and the server log are uploaded if it fails.
+
+The CI environment variables are throwaway test values. No repository secrets are needed. Dependabot (`.github/dependabot.yml`) opens weekly grouped dependency updates. Major framework upgrades are left for a deliberate, manual upgrade.

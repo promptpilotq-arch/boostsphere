@@ -1,5 +1,7 @@
 # BoostSphere
 
+[![CI](https://github.com/promptpilotq-arch/boostsphere/actions/workflows/ci.yml/badge.svg)](https://github.com/promptpilotq-arch/boostsphere/actions/workflows/ci.yml)
+
 A full-stack platform for **authorized social media promotion services** and a **moderated marketplace for transferable digital assets**, built for international customers with Nigeria (NGN) as the launch market.
 
 - Next.js 15 (App Router) · React 19 · TypeScript · Tailwind CSS
